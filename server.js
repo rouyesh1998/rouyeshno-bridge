@@ -1,70 +1,108 @@
-import express from "express";
-import cors from "cors";
-import { createServer } from "http";
-import { Server } from "socket.io";
-import { Telegraf } from "telegraf";
-import { nanoid } from "nanoid";
-
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID);
-const PORT = process.env.PORT || 3000;
-const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
-
-if (!TELEGRAM_BOT_TOKEN || !ADMIN_CHAT_ID) {
-  console.error("❌ توکن یا چت آیدی تنظیم نشده");
-  process.exit(1);
-}
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const TelegramBot = require("node-telegram-bot-api");
+const Redis = require("ioredis");
 
 const app = express();
-app.use(cors({ origin: ALLOW_ORIGIN === "*" ? true : [ALLOW_ORIGIN] }));
-const httpServer = createServer(app);
-const io = new Server(httpServer, { cors: { origin: ALLOW_ORIGIN } });
-
-const sessions = new Map();
-const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
-
-bot.start((ctx) => {
-  if (ctx.chat.id !== ADMIN_CHAT_ID) return;
-  ctx.reply("پل تلگرام ↔ سایت فعال شد.\nبرای پاسخ: /r SESSION پیام");
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.ALLOW_ORIGIN || "*",
+    methods: ["GET", "POST"],
+  },
 });
 
-bot.hears(/^\/r\s+(\w+)\s+([\s\S]+)/, async (ctx) => {
-  if (ctx.chat.id !== ADMIN_CHAT_ID) return;
-  const sessionId = ctx.match[1];
-  const text = ctx.match[2].trim();
-  const entry = sessions.get(sessionId);
-  if (!entry) return ctx.reply(`❌ جلسه پیدا نشد: ${sessionId}`);
-  entry.socket.emit("server_message", { from: "admin", text });
-  await ctx.reply(`✅ ارسال شد به ${sessionId}`);
+// متغیرهای محیطی
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const REDIS_URL = process.env.REDIS_URL;
+
+// اتصال به ردیـس برای ذخیره پیام‌ها
+const redis = new Redis(REDIS_URL);
+
+// ربات تلگرام
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+
+// اندپوینت هلت‌چک برای Render
+app.get("/healthz", (req, res) => {
+  res.send("OK");
 });
 
-bot.launch().then(() => console.log("🤖 Bot started"));
+// وقتی کاربر وصل میشه
+io.on("connection", async (socket) => {
+  console.log("یک کاربر وصل شد:", socket.id);
 
-io.on("connection", (socket) => {
-  const sessionId = nanoid(6);
-  sessions.set(sessionId, { socket, createdAt: Date.now() });
+  // بررسی وجود sessionId
+  let sessionId = socket.handshake.auth.sessionId;
+  if (!sessionId) {
+    sessionId = socket.id;
+  }
+  socket.sessionId = sessionId;
 
+  // پیام خوش‌آمد
   socket.emit("session", { sessionId });
-  bot.telegram.sendMessage(
-    ADMIN_CHAT_ID,
-    `🟢 اتصال جدید\nSession: ${sessionId}\nبرای پاسخ: /r ${sessionId} پیام`
-  );
 
-  socket.on("client_message", async ({ text, name, phone }) => {
-    const msg =
-      `💬 پیام جدید\nSession: ${sessionId}\n` +
-      (name ? `نام: ${name}\n` : ``) +
-      (phone ? `شماره: ${phone}\n` : ``) +
-      `متن:\n${text}`;
-    await bot.telegram.sendMessage(ADMIN_CHAT_ID, msg);
-    socket.emit("server_message", { from: "bot", text: "پیام شما ارسال شد ✅" });
+  // بازیابی پیام‌های قبلی از Redis
+  const prevMessages = await redis.lrange(`chat:${sessionId}`, 0, -1);
+  prevMessages.forEach((msg) => {
+    const data = JSON.parse(msg);
+    socket.emit("server_message", data);
   });
 
-  socket.on("disconnect", () => {
-    sessions.delete(sessionId);
-    bot.telegram.sendMessage(ADMIN_CHAT_ID, `🔴 قطع ارتباط\nSession: ${sessionId}`);
+  // دریافت پیام از کاربر
+  socket.on("client_message", async (msg) => {
+    const data = {
+      from: "user",
+      text: msg.text,
+      name: msg.name || "",
+      phone: msg.phone || "",
+      time: Date.now(),
+    };
+
+    // ذخیره در Redis
+    await redis.rpush(`chat:${sessionId}`, JSON.stringify(data));
+
+    // فرستادن به ادمین تلگرام
+    bot.sendMessage(
+      ADMIN_CHAT_ID,
+      `پیام جدید از کاربر:\n\nنام: ${msg.name || "نامشخص"}\nشماره: ${
+        msg.phone || "نداده"
+      }\nپیام: ${msg.text}`
+    );
   });
 });
 
-app.get("/", (req, res) => res.send("Bridge is running..."));
-httpServer.listen(PORT, () => console.log("🚀 Server on port", PORT));
+// وقتی ادمین در تلگرام پیام میفرسته → ارسال به وب
+bot.on("message", async (msg) => {
+  if (msg.chat.id.toString() !== ADMIN_CHAT_ID) return;
+
+  const text = msg.text;
+  const sessionId = msg.reply_to_message
+    ? msg.reply_to_message.text.split(" ")[2]
+    : null;
+
+  // اگر کاربر انتخاب نشده باشه
+  if (!sessionId) {
+    bot.sendMessage(ADMIN_CHAT_ID, "⚠️ برای پاسخ به کاربر، روی پیامش ریپلای کن.");
+    return;
+  }
+
+  const data = {
+    from: "admin",
+    text,
+    time: Date.now(),
+  };
+
+  // ذخیره در Redis
+  await redis.rpush(`chat:${sessionId}`, JSON.stringify(data));
+
+  // فرستادن به کاربر در وب
+  io.to(sessionId).emit("server_message", data);
+});
+
+// شروع سرور
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`سرور روی پورت ${PORT} بالا اومد ✅`);
+});
