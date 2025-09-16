@@ -21,6 +21,19 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: ORIGINS.includes("*") ? "*" : ORIGINS, credentials: true }));
 app.get("/healthz", (req, res) => res.type("text").send("ok"));
+// بعد از app.get("/healthz", ...) اضافه کن:
+app.get("/debug/redis", async (req, res) => {
+  try {
+    if (!redis) throw new Error("Redis not configured");
+    const pong = await redis.ping();
+    await redis.set("rx:test", "ok", "EX", 60);
+    const val = await redis.get("rx:test");
+    res.json({ ok: true, ping: pong, sample: val });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/", (req, res) => res.send("bridge up"));
 const server = http.createServer(app);
 
@@ -87,3 +100,4 @@ io.on("connection", async (socket) => {
 server.listen(PORT, () => {
   console.log("Bridge listening on", PORT, "origins:", ORIGINS);
 });
+
